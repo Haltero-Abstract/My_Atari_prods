@@ -1,0 +1,8 @@
+# not published : music modules (other authors), Hatari, test logs, backups
+3Dreams/ZIK/
+3Dreams/outils/hatari*/
+3Dreams/outils/ORIG/
+3DLOG*.TXT
+*.LST
+.claude/
+CLAUDE.md

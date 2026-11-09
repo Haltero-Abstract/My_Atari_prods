@@ -1,0 +1,913 @@
+; 3DREAMS.A56 - 3D computed by the DSP for 3Dreams (vertices + Gouraud faces)
+;   loaded together with Simplet's replay (his files are not
+;   modified : only his idle loop is redirected). His replay works under
+;   interrupt ; this program runs in his idle
+;   loop instead. The 030 only talks to this program when the music does
+;   not talk (MGTK_Replay_In_Service = 0, Timer A masked) : no music
+;   interrupt during a command, so the
+;   registers can be used freely (except r6/r7, m0-m7).
+;
+;   Memory (Falcon : X $0000-$3FFF = P $4000-$7FFF, Y = P $0000-$3FFF)
+;     Simplet : P $0000-$0143, X/Y $0000-$0FFF, X/Y $3000-$37FF
+;     here    : P $2000-...    , X $1000-$27FF
+;
+;   Commands (24-bit word : command << 16 | parameter)
+;     1 UPLOAD   addr, count, words... -> $400000
+;     2 FACE n   ramp, n x (x,y,i)     -> $C00000 | ymin<<9 | nlines
+;                                         then the 1st packet (like LINES)
+;     3 LINES k                        -> k x ($800000 | x<<9 | n-1, n pixels)
+;                                         then $400000
+;     4 PING                           -> $5A5A5A
+;     5 XFORM n  1st, flags, matrix 9 (x2^23), lo 3 (x2^23),
+;                offx, offy, offz, pathx, pathy, ymax
+;                -> per vertex : rx ry rz  X Y  [i]  [u v]  then $400000
+;                (flags : bit 0 = intensity, bit 1 = fake Phong u,v)
+;     7 FACEUV n n x (x,y,u,v)          -> as FACE, for Phong / chrome :
+;                a pixel = index (v.int << 8 | u.int) in the 256x256
+;                map of the 030 (u,v in 8.8) ; same LINES afterwards
+;     6 MORPH    s, f/2, matrix 9 (x2^23), pathx, pathy, ymax
+;                -> 512 words : per point (X/2)<<8 | Y, then rz ; $400000
+;                the 256 points of the morphing cloud : p = (from + s
+;                (to - from)) * f, rotated and projected like XFORM. The
+;                two clouds are loaded by UPLOAD (MFROM, MTO) at the start
+;                of each morphing. All the points are computed first, then
+;                sent in a row (the 030 reads them without waiting).
+
+HSR     equ     $ffe9
+HTX     equ     $ffeb
+
+RAMPX   equ     $1000           ; ramps (4 materials x 224, Gouraud then cel)
+RECIP   equ     $1700           ; $7fffff / w   (w = 0..320)
+PRCP    equ     $1900           ; 2^23 / d (rounded up), d = 0..1023
+XA      equ     $1D00           ; chains A and B : x and intensity per line
+XB      equ     $1E00
+IA      equ     $1F00
+IB      equ     $2000
+VBUF    equ     $2100           ; vertices (x,y,i) x 9
+NV      equ     $2140
+RBASE   equ     $2141
+YMIN    equ     $2142
+LCUR    equ     $2143
+SX      equ     $2144
+SI      equ     $2145
+DY      equ     $2146
+TMP     equ     $2147
+WW      equ     $2148
+NL      equ     $2149
+EIA     equ     $214A           ; edge : table of chain A for its value
+EIB     equ     $214B           ;        table of chain B
+UVM     equ     $214C           ; lines : 0 = shades, 1 = u,v indices
+UL      equ     $214D           ; lineuv : u, v at both ends
+UR      equ     $214E
+VL      equ     $214F
+VR      equ     $2150
+LHDR    equ     $2151
+VBUF2   equ     $21A0           ; FACEUV : vertices (x,y,v) x 9
+VA      equ     $2800           ; FACEUV : v of chains A and B (shares
+VB      equ     $2900           ;   the MORPH memory : never at the same
+LBU     equ     $2A00           ;   time) ; u and v of a line
+LBV     equ     $2B40
+XF      equ     $2160           ; XFORM parameters (matrix 9, lo 3, ...)
+LO      equ     XF+9
+OFFX    equ     XF+12
+OFFY    equ     XF+13
+OFFZ    equ     XF+14
+PATHX   equ     XF+15
+PATHY   equ     XF+16
+YMAXS   equ     XF+17
+FLAGS   equ     XF+18
+TX      equ     XF+19
+TY      equ     XF+20
+TZ      equ     XF+21
+MPS     equ     XF+22           ; MORPH : progress s (fraction)
+MPF     equ     XF+23           ;         swelling f / 2 (fraction)
+MPV     equ     XF+24           ;         interpolated point (3 words)
+MFROM   equ     $2800           ; morphing : starting cloud (256 x 3)
+MTO     equ     $2B00           ;            target cloud (256 x 3)
+MOUT    equ     $2E00           ;            results (256 x 2)
+VTX     equ     $2200           ; object vertices : x,y,z,nx,ny,nz (x 256)
+BATCH   equ     40              ; lines per packet (same value on the 030 side)
+
+; Entry : the program is loaded WITH Simplet's one (same
+; Dsp_ExecProg, his blocks first). His initialisation ends with
+; the idle loop 'jmp p:$66' : this word is redirected to our
+; code (through a relay in free internal RAM, $144).
+        org     p:$0066
+        dc      $0c0144                 ; jmp <$144  (instead of jmp <$66)
+        org     p:$0144
+        jmp     init
+
+        org     p:$2000
+init
+        andi    #$fc,mr                 ; interrupts (SSI of the music)
+main
+        jclr    #0,x:HSR,main
+        movep   x:HTX,a                 ; command
+        move    a1,b
+        move    #>$00ffff,x1
+        and     x1,b                    ; b1 = parameter
+        rep     #16
+        lsr     a                       ; a1 = command
+        move    #>1,x0
+        cmp     x0,a
+        jeq     c_upload
+        move    #>2,x0
+        cmp     x0,a
+        jeq     c_face
+        move    #>3,x0
+        cmp     x0,a
+        jeq     c_lines
+        move    #>4,x0
+        cmp     x0,a
+        jeq     c_ping
+        move    #>5,x0
+        cmp     x0,a
+        jeq     c_xform
+        move    #>7,x0
+        cmp     x0,a
+        jeq     c_faceuv
+        move    #>6,x0
+        cmp     x0,a
+        jeq     c_morph
+        jmp     main
+
+rd_a    jclr    #0,x:HSR,rd_a
+        movep   x:HTX,a
+        rts
+wr_a    jclr    #1,x:HSR,wr_a
+        movep   a,x:HTX
+        rts
+
+c_ping
+        move    #>$5a5a5a,a
+        jsr     wr_a
+        jmp     main
+
+; --- UPLOAD : X address, count, words ---
+c_upload
+        jsr     rd_a
+        move    a1,r0
+        jsr     rd_a
+        move    a1,x0
+        do      x0,ul_end
+ul_w    jclr    #0,x:HSR,ul_w
+        movep   x:HTX,x:(r0)+
+        nop
+ul_end
+        move    #>$400000,a
+        jsr     wr_a
+        jmp     main
+
+; --- FACE : ramp, n vertices ; traces the edges ---
+c_face
+        move    b1,x:NV
+        jsr     rd_a
+        move    a1,x:RBASE
+        move    #VBUF,r0
+        move    x:NV,x0
+        do      x0,fv_end
+        jsr     rd_a
+        move    a1,x:(r0)+
+        jsr     rd_a
+        move    a1,x:(r0)+
+        jsr     rd_a
+        move    a1,x:(r0)+
+        nop
+fv_end
+        move    #VBUF,r1                ; 1st vertex copied at the end
+        do      #3,cp_end
+        move    x:(r1)+,x0
+        move    x0,x:(r0)+
+cp_end
+        ; ymin / ymax
+        move    #VBUF+1,r1
+        move    #3,n1
+        move    #>1000,a
+        move    #>-1000,b
+        move    x:NV,x0
+        do      x0,mm_end
+        move    x:(r1)+n1,x1
+        cmp     x1,a
+        tgt     x1,a
+        cmp     x1,b
+        tlt     x1,b
+        nop
+mm_end
+        move    a1,x:YMIN
+        clr     a
+        move    a1,x:LCUR
+        sub     a,b                     ; (a = 0 : b unchanged)
+        move    x:YMIN,x0
+        sub     x0,b                    ; ymax - ymin
+        jeq     f_zero
+        move    #>1,x0
+        add     x0,b
+        jmp     f_nl
+f_zero  clr     b
+f_nl    move    b1,x:NL                 ; number of lines
+        clr     a
+        move    a1,x:UVM                ; lines : shades
+        move    #>IA,a
+        move    a1,x:EIA
+        move    #>IB,a
+        move    a1,x:EIB
+        ; edges
+        move    #VBUF,r4
+        move    x:NV,x0
+        do      x0,ed_end
+        jsr     edge
+        nop
+ed_end
+        ; answer : $C00000 | ymin << 9 | nlines
+        move    x:YMIN,a
+        rep     #9
+        lsl     a
+        move    x:NL,x0
+        add     x0,a
+        move    #>$c00000,x0
+        add     x0,a
+        jsr     wr_a
+        ; 1st packet of lines right away : min(nlines, BATCH)
+        move    x:NL,b
+        tst     b
+        jeq     main
+        move    #>BATCH,x0
+        cmp     x0,b
+        tgt     x0,b
+        jmp     c_lines
+
+; edge : edge r4 -> r4+3 (x,y,i) ; going down = chain A, going up = chain B
+edge
+        move    r4,r5
+        move    #3,n4
+        move    x:(r5)+,x0              ; X0
+        move    x:(r5)+,x1              ; Y0
+        move    x:(r5)+,y0              ; I0
+        move    x:(r5)+,a               ; X1
+        move    x:(r5)+,b               ; Y1
+        move    x:(r5)+,y1              ; I1
+        lua     (r4)+n4,r4
+        cmp     x1,b
+        jeq     e_ret
+        jgt     e_down
+        move    a,x:TMP                 ; going up : swap the vertices
+        tfr     x0,a
+        move    x:TMP,x0
+        move    b,x:TMP
+        tfr     x1,b
+        move    x:TMP,x1
+        move    y0,x:TMP
+        move    y1,y0
+        move    x:TMP,y1
+        move    #XB,r1
+        move    x:EIB,r2
+        jmp     e_go
+e_down  move    #XA,r1
+        move    x:EIA,r2
+e_go    sub     x1,b                    ; dy
+        move    x1,n1
+        move    x1,n2
+        sub     x0,a                    ; dx
+        move    #RECIP,r3
+        move    b1,n3
+        move    b1,x:DY
+        move    x0,x:SX
+        move    y0,x:SI
+        lua     (r1)+n1,r1
+        lua     (r2)+n2,r2
+        move    a1,x1
+        move    x:(r3+n3),x0            ; 1/dy
+        mpy     x0,x1,a                 ; dx/dy
+        move    y1,b
+        sub     y0,b
+        rep     #8                      ; difference on 16 bits (u,v wrap
+        asl     b                       ; around as on the 030 ; no effect
+        move    b1,b                    ; on the shades)
+        rep     #8
+        asr     b
+        move    b1,x1
+        mpy     x0,x1,b                 ; di/dy
+        move    a1,x1
+        move    a0,x0
+        move    b1,y1
+        move    b0,y0
+        move    x:SX,a
+        move    #>$800000,a0            ; x + 0.5
+        move    x:SI,b
+        move    x:DY,n5
+        do      n5,el_end
+        add     x,a     a,x:(r1)+
+        add     y,b     b,x:(r2)+
+el_end
+        move    a,x:(r1)+
+        move    b,x:(r2)+
+e_ret   rts
+
+; --- LINES k : header + pixels for k lines, then $400000 ---
+c_lines
+        move    b1,n5
+        do      n5,ln_end
+        jsr     linesel
+        nop
+ln_end
+        move    #>$400000,a
+        jsr     wr_a
+        jmp     main
+
+line
+        move    x:YMIN,a
+        move    x:LCUR,x0
+        add     x0,a
+        move    #>1,y0
+        tfr     x0,b
+        add     y0,b
+        move    b1,x:LCUR
+        move    a1,n0
+        move    a1,n1
+        move    a1,n2
+        move    a1,n3
+        move    #XA,r0
+        move    #XB,r1
+        move    #IA,r2
+        move    #IB,r3
+        nop
+        move    x:(r0+n0),a             ; xa
+        move    x:(r1+n1),b             ; xb
+        move    x:(r2+n2),x0            ; ia
+        move    x:(r3+n3),x1            ; ib
+        cmp     a,b
+        jge     l_ord
+        move    a,x:TMP                 ; xb < xa : swap
+        tfr     b,a
+        move    x:TMP,b
+        move    x0,x:TMP
+        move    x1,x0
+        move    x:TMP,x1
+l_ord   move    a1,x:SX
+        sub     a,b                     ; w
+        move    b1,x:WW
+        move    b1,n4
+        move    #RECIP,r4
+        ; header $800000 | x << 9 | (n - 1)
+        rep     #9
+        lsl     a
+        add     b,a
+        move    #>$800000,y0
+        add     y0,a
+        jsr     wr_a
+        ; intensity step : (ib - ia) / w
+        move    x:(r4+n4),y0
+        tfr     x1,a
+        sub     x0,a
+        move    a1,y1
+        mpy     y0,y1,a
+        tfr     x0,b
+        rep     #7
+        asr     a
+        rep     #7
+        asr     b
+        move    x:RBASE,y1
+        move    #0,y0
+        add     y,b                     ; b1 = address of the shade
+        move    x:WW,r5
+        nop
+        lua     (r5)+,r5                ; w + 1 pixels
+        nop
+        do      r5,px_end
+        add     a,b     b,r1
+px_w    jclr    #1,x:HSR,px_w
+        movep   x:(r1),x:HTX
+px_end
+        rts
+
+; --- FACEUV n : vertices x,y,u,v (Phong / chrome) ---
+c_faceuv
+        move    b1,x:NV
+        move    #VBUF,r0                ; (x,y,u)
+        move    #VBUF2,r1               ; (x,y,v)
+        move    x:NV,x0
+        do      x0,fu_end
+        jsr     rd_a
+        move    a1,x:(r0)+
+        move    a1,x:(r1)+
+        jsr     rd_a
+        move    a1,x:(r0)+
+        move    a1,x:(r1)+
+        jsr     rd_a
+        move    a1,x:(r0)+
+        jsr     rd_a
+        move    a1,x:(r1)+
+        nop
+fu_end
+        move    #VBUF,r2                ; 1st vertex copied at the end
+        move    #VBUF2,r3
+        do      #3,fc_end
+        move    x:(r2)+,x0
+        move    x0,x:(r0)+
+        move    x:(r3)+,x1
+        move    x1,x:(r1)+
+fc_end
+        ; ymin / ymax
+        move    #VBUF+1,r1
+        move    #3,n1
+        move    #>1000,a
+        move    #>-1000,b
+        move    x:NV,x0
+        do      x0,fm_end
+        move    x:(r1)+n1,x1
+        cmp     x1,a
+        tgt     x1,a
+        cmp     x1,b
+        tlt     x1,b
+        nop
+fm_end
+        move    a1,x:YMIN
+        clr     a
+        move    a1,x:LCUR
+        sub     a,b
+        move    x:YMIN,x0
+        sub     x0,b                    ; ymax - ymin
+        jeq     fu_zero
+        move    #>1,x0
+        add     x0,b
+        jmp     fu_nl
+fu_zero clr     b
+fu_nl   move    b1,x:NL
+        move    #>1,a
+        move    a1,x:UVM                ; lines : u,v indices
+        ; edges : x and u (IA/IB), then x again and v (VA/VB)
+        move    #>IA,a
+        move    a1,x:EIA
+        move    #>IB,a
+        move    a1,x:EIB
+        move    #VBUF,r4
+        move    x:NV,x0
+        do      x0,fe1_end
+        jsr     edge
+        nop
+fe1_end
+        move    #>VA,a
+        move    a1,x:EIA
+        move    #>VB,a
+        move    a1,x:EIB
+        move    #VBUF2,r4
+        move    x:NV,x0
+        do      x0,fe2_end
+        jsr     edge
+        nop
+fe2_end
+        ; answer : $C00000 | ymin << 9 | nlines, then the 1st packet
+        move    x:YMIN,a
+        rep     #9
+        lsl     a
+        move    x:NL,x0
+        add     x0,a
+        move    #>$c00000,x0
+        add     x0,a
+        jsr     wr_a
+        move    x:NL,b
+        tst     b
+        jeq     main
+        move    #>BATCH,x0
+        cmp     x0,b
+        tgt     x0,b
+        jmp     c_lines
+
+linesel
+        move    x:UVM,a
+        tst     a
+        jne     lineuv
+        jmp     line
+
+; lineuv : one line of a FACEUV : header, then w+1 indices
+;   (v.int << 8 | u.int) : u and v of the line in 2 passes (LBU, LBV),
+;   then put together and sent
+lineuv
+        move    x:YMIN,a
+        move    x:LCUR,x0
+        add     x0,a
+        move    #>1,y0
+        tfr     x0,b
+        add     y0,b
+        move    b1,x:LCUR
+        move    a1,n0
+        move    a1,n1
+        move    a1,n2
+        move    a1,n3
+        move    a1,n4
+        move    a1,n5
+        move    #XA,r0
+        move    #XB,r1
+        move    #IA,r2
+        move    #IB,r3
+        move    #VA,r4
+        move    #VB,r5
+        nop
+        move    x:(r2+n2),x0            ; ua
+        move    x:(r3+n3),x1            ; ub
+        move    x:(r4+n4),y0            ; va
+        move    x:(r5+n5),y1            ; vb
+        move    x:(r0+n0),a             ; xa
+        move    x:(r1+n1),b             ; xb
+        cmp     a,b
+        jge     lu_ord
+        move    a,x:TMP                 ; xb < xa : swap
+        tfr     b,a
+        move    x:TMP,b
+        move    x0,x:TMP
+        move    x1,x0
+        move    x:TMP,x1
+        move    y0,x:TMP
+        move    y1,y0
+        move    x:TMP,y1
+lu_ord  move    x0,x:UL
+        move    x1,x:UR
+        move    y0,x:VL
+        move    y1,x:VR
+        sub     a,b                     ; w
+        move    b1,x:WW
+        ; header $800000 | x << 9 | (n - 1) : sent once the indices are
+        ; ready (the 030 then reads them without waiting)
+        rep     #9
+        lsl     a
+        add     b,a
+        move    #>$800000,y0
+        add     y0,a
+        move    a1,x:LHDR
+        ; steps : (ur - ul) / w, (vr - vl) / w
+        move    x:WW,n4
+        move    #RECIP,r4
+        nop
+        move    x:(r4+n4),y0            ; 1 / w
+        move    x:UR,a
+        move    x:UL,x0
+        sub     x0,a
+        rep     #8                      ; (on 16 bits)
+        asl     a
+        move    a1,a
+        rep     #8
+        asr     a
+        move    a1,y1
+        mpy     y0,y1,a                 ; u step (8.8)
+        rep     #8
+        asr     a                       ; -> in texels
+        move    a1,x1
+        move    a0,x0
+        move    x:VR,b
+        move    x:VL,y1
+        sub     y1,b
+        rep     #8                      ; (on 16 bits)
+        asl     b
+        move    b1,b
+        rep     #8
+        asr     b
+        move    b1,y1
+        mpy     y0,y1,b                 ; v step (8.8)
+        move    b1,y1
+        move    b0,y0
+        move    x:WW,r1
+        nop
+        lua     (r1)+,r1                ; w + 1 pixels
+        ; pass 1 : u in texels (integer part = u.int)
+        move    x:UL,a
+        rep     #8
+        asr     a
+        move    #LBU,r0
+        rep     r1
+        add     x,a     a1,x:(r0)+
+        ; pass 2 : v in 8.8
+        move    x:VL,b
+        move    #LBV,r2
+        rep     r1
+        add     y,b     b1,x:(r2)+
+        ; header, then pass 3 : (v & $FF00) | u.int put together and sent
+        ; at once (7 instructions a pixel : still well ahead of the 030,
+        ; which reads them without waiting)
+        move    x:LHDR,a
+        jsr     wr_a
+        move    #LBU,r0
+        move    #LBV,r2
+        move    #>$00ff00,y0
+        move    #>$0000ff,y1
+        do      r1,lu_end
+        move    x:(r0)+,a
+        and     y1,a    x:(r2)+,b
+        and     y0,b    a1,x0
+        or      x0,b
+lu_w    jclr    #1,x:HSR,lu_w
+        movep   b,x:HTX
+lu_end
+        rts
+
+; --- XFORM : rotation + projection + lighting of the vertices ---
+c_xform
+        move    b1,x:NV                 ; number of vertices
+        move    #XF-2,r0                ; 1st, flags, then XF...
+        jsr     rd_a
+        move    a1,x:TMP                ; 1st vertex
+        jsr     rd_a
+        move    a1,x:FLAGS
+        move    #XF,r0
+        do      #18,xp_end
+        jsr     rd_a
+        move    a1,x:(r0)+
+        nop
+xp_end
+        ; r0 = VTX + 6 * 1er
+        move    x:TMP,a
+        asl     a                       ; 2
+        move    a1,x0
+        asl     a                       ; 4
+        add     x0,a                    ; 6
+        move    #>VTX,x0
+        add     x0,a
+        move    a1,r0
+        move    x:NV,x0
+        do      x0,xv_end
+        jsr     xvert
+        nop
+xv_end
+        move    #>$400000,a
+        jsr     wr_a
+        jmp     main
+
+; xvert : vertex x:(r0) -> sends rx ry rz X Y [i] [u v] ; r0 += 6
+xvert
+        move    x:(r0)+,y0              ; vx
+        move    x:(r0)+,y1              ; vy
+        move    x:(r0)+,x1              ; vz
+        move    #XF,r4
+        nop
+        move    x:(r4)+,x0
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a   x:(r4)+,x0
+        mpy     x0,y0,b   x:(r4)+,x0
+        mac     x0,y1,b   x:(r4)+,x0
+        mac     x0,x1,b   x:(r4)+,x0
+        move    a1,x:TX
+        move    b1,x:TY
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a
+        move    x:OFFZ,x0
+        add     x0,a
+        move    a1,x:TZ                 ; rz
+        move    x:TX,a
+        move    x:OFFX,x0
+        add     x0,a
+        move    a1,x:TX                 ; rx
+        move    x:TY,a
+        move    x:OFFY,x0
+        add     x0,a
+        move    a1,x:TY                 ; ry
+        ; send rx ry rz
+        move    x:TX,a
+        jsr     wr_a
+        move    x:TY,a
+        jsr     wr_a
+        move    x:TZ,a
+        jsr     wr_a
+        ; d = rz + 300 (1..1023) -> 1/d
+        move    x:TZ,a
+        move    #>300,x0
+        add     x0,a
+        move    #>1,x0
+        cmp     x0,a
+        tlt     x0,a
+        move    #>1023,x0
+        cmp     x0,a
+        tgt     x0,a
+        move    a1,n4
+        move    #PRCP,r4
+        nop
+        move    x:(r4+n4),x1            ; 1/d (x 2^23)
+        ; X = trunc(rx*256/d) + pathx, clamped 0..319
+        move    x:TX,a
+        jsr     proj1
+        move    x:PATHX,x0
+        add     x0,a
+        move    #>319,x0
+        jsr     clamp
+        jsr     wr_a
+        ; Y = trunc(ry*256/d) + pathy, clamped 0..ymax
+        move    x:TY,a
+        jsr     proj1
+        move    x:PATHY,x0
+        add     x0,a
+        move    x:YMAXS,x0
+        jsr     clamp
+        jsr     wr_a
+        ; lighting
+        move    x:FLAGS,a
+        move    #>1,x0
+        and     x0,a
+        jeq     xv_nolight
+        move    x:(r0)+,y0              ; nx
+        move    x:(r0)+,y1              ; ny
+        move    x:(r0)+,x1              ; nz
+        move    x:FLAGS,a
+        move    #>2,x0
+        and     x0,a
+        jeq     xv_nph
+        ; fake Phong : u = (n . row x) * 63/64 + 16384, same for v
+        move    #XF,r4
+        nop
+        move    x:(r4)+,x0
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a   x:(r4)+,x0
+        mpy     x0,y0,b   x:(r4)+,x0
+        mac     x0,y1,b   x:(r4)+,x0
+        mac     x0,x1,b
+        move    a1,x:TX
+        move    b1,x:TY
+        jsr     xlight                  ; intensity first (order of the 030)
+        jsr     wr_a
+        move    x:TX,a
+        jsr     uv1
+        jsr     wr_a
+        move    x:TY,a
+        jsr     uv1
+        jsr     wr_a
+        rts
+xv_nph  jsr     xlight
+        jsr     wr_a
+        rts
+xv_nolight
+        move    (r0)+
+        move    (r0)+
+        move    (r0)+
+        rts
+
+; xlight : normal (y0,y1,x1) . lo -> a = shade 0..127 x 128
+xlight
+        move    #LO,r4
+        nop
+        move    x:(r4)+,x0
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a
+        move    a1,a                    ; integer part only
+        tst     a
+        jge     xl_p
+        clr     a
+xl_p    move    a1,x0
+        move    #>$650000,y0            ; (127 - 26) x 2 / 256
+        mpy     x0,y0,a
+        move    a1,a
+        move    #>3328,x0               ; ambient 26 x 128
+        add     x0,a
+        move    #>16256,x0              ; 127 x 128 max
+        cmp     x0,a
+        tgt     x0,a
+        rts
+
+; uv1 : a = rotated component -> a * 63/64 + 16384
+uv1
+        move    a1,x0
+        move    #>$7e0000,y0
+        mpy     x0,y0,a
+        move    a1,a
+        move    #>16384,x0
+        add     x0,a
+        rts
+
+; proj1 : a = coordinate, x1 = 1/d -> a = trunc(a * 256 / d)
+proj1
+        rep     #8
+        asl     a
+        tst     a
+        jlt     pj_neg
+        move    a1,y0
+        mpy     x1,y0,a
+        move    a1,a
+        rts
+pj_neg  neg     a
+        move    a1,y0
+        mpy     x1,y0,a
+        move    a1,a
+        neg     a
+        rts
+
+; --- MORPH : the 256 points of the cloud ---
+c_morph
+        jsr     rd_a
+        move    a1,x:MPS
+        jsr     rd_a
+        move    a1,x:MPF
+        move    #XF,r0
+        do      #9,mrf_p
+        jsr     rd_a
+        move    a1,x:(r0)+
+        nop
+mrf_p
+        jsr     rd_a
+        move    a1,x:PATHX
+        jsr     rd_a
+        move    a1,x:PATHY
+        jsr     rd_a
+        move    a1,x:YMAXS
+        move    #MFROM,r1
+        move    #MTO,r2
+        move    #MOUT,r5
+        do      #256,mrf_v
+        jsr     mpt
+        nop
+mrf_v
+        move    #MOUT,r5
+        do      #512,mrf_o
+mrf_w    jclr    #1,x:HSR,mrf_w
+        movep   x:(r5)+,x:HTX
+        nop
+mrf_o
+        move    #>$400000,a
+        jsr     wr_a
+        jmp     main
+
+; mpt : point x:(r1) / x:(r2) -> 2 words in x:(r5)+ ; r1, r2 += 3
+mpt
+        move    #MPV,r3
+        do      #3,mrf_c
+        move    x:(r1)+,a               ; from
+        move    x:(r2)+,b               ; to
+        sub     a,b
+        move    b1,y0
+        move    x:MPS,x0
+        mpy     x0,y0,b                 ; s (to - from)
+        add     b,a
+        move    a1,y0                   ; q
+        move    x:MPF,x0
+        mpy     x0,y0,a                 ; q f / 2
+        asl     a                       ; q f
+        move    a1,x:(r3)+
+mrf_c
+        move    #MPV,r3
+        nop
+        move    x:(r3)+,y0              ; x
+        move    x:(r3)+,y1              ; y
+        move    x:(r3)+,x1              ; z
+        move    #XF,r4
+        nop
+        move    x:(r4)+,x0
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a   x:(r4)+,x0
+        mpy     x0,y0,b   x:(r4)+,x0
+        mac     x0,y1,b   x:(r4)+,x0
+        mac     x0,x1,b   x:(r4)+,x0
+        move    a1,x:TX                 ; rx
+        move    b1,x:TY                 ; ry
+        mpy     x0,y0,a   x:(r4)+,x0
+        mac     x0,y1,a   x:(r4)+,x0
+        mac     x0,x1,a
+        move    a1,x:TZ                 ; rz
+        ; d = rz + 300 (1..1023) -> 1/d
+        move    a1,a
+        move    #>300,x0
+        add     x0,a
+        move    #>1,x0
+        cmp     x0,a
+        tlt     x0,a
+        move    #>1023,x0
+        cmp     x0,a
+        tgt     x0,a
+        move    a1,n4
+        move    #PRCP,r4
+        nop
+        move    x:(r4+n4),x1            ; 1/d
+        ; X = trunc(rx*256/d) + pathx, 0..318, halved (2x2 points)
+        move    x:TX,a
+        jsr     proj1
+        move    x:PATHX,x0
+        add     x0,a
+        move    #>318,x0
+        jsr     clamp
+        asr     a
+        move    a1,a
+        rep     #8
+        asl     a
+        move    a1,x:TX                 ; (X/2) << 8
+        ; Y = trunc(ry*256/d) + pathy, 0..ymax
+        move    x:TY,a
+        jsr     proj1
+        move    x:PATHY,x0
+        add     x0,a
+        move    x:YMAXS,x0
+        jsr     clamp
+        move    a1,x0
+        move    x:TX,a
+        add     x0,a
+        move    a1,x:(r5)+
+        move    x:TZ,a
+        move    a1,x:(r5)+
+        rts
+
+; clamp : a clamped to 0..x0
+clamp
+        cmp     x0,a
+        tgt     x0,a
+        tst     a
+        jge     cl_ok
+        clr     a
+cl_ok   rts

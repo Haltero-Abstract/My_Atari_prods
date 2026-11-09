@@ -1,0 +1,37 @@
+; bouquet final : un cube dans le cube, meme rotation avec 2 s de retard
+; format : voir l'en-tete de p_obj (N M P V F E L)
+N CUBESS
+M T
+V -40 -40 -40
+V 40 -40 -40
+V 40 40 -40
+V -40 40 -40
+V -40 -40 40
+V 40 -40 40
+V 40 40 40
+V -40 40 40
+F 1 0 1 2 3
+F 1 4 5 6 7
+F 2 0 3 7 4
+F 2 1 2 6 5
+F 3 0 1 5 4
+F 3 3 2 6 7
+; 2e partie : 120 images de retard = 2 secondes a 60 Hz (VGA)
+P 120
+; elle rebondit comme une balle : hauteur 24, aller-retour 16, rebond en 50 images,
+; traversee en 170 images (rayon 10,4 + racine(24x24+16x16) = 39,2 : reste dans le grand cube)
+B 24 16 50 170
+V -6 -6 -6
+V 6 -6 -6
+V 6 6 -6
+V -6 6 -6
+V -6 -6 6
+V 6 -6 6
+V 6 6 6
+V -6 6 6
+F 1 8 9 10 11
+F 1 12 13 14 15
+F 2 8 11 15 12
+F 2 9 10 14 13
+F 3 8 9 13 12
+F 3 11 10 14 15
